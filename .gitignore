@@ -1,0 +1,73 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri / Rust build artifacts
+src-tauri/target/
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# ----------------------------------------------------
+# Binaries & Tauri Sidecars (Prevents GitHub 100MB block)
+# ----------------------------------------------------
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# ----------------------------------------------------
+# Sensitive Data & Certificates
+# ----------------------------------------------------
+*.env
+*.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.cert
+credentials.json
+
+# ----------------------------------------------------
+# Large Media & Archives
+# ----------------------------------------------------
+*.zip
+*.tar.gz
+*.7z
+*.rar
+*.mp4
+*.mkv
+*.webm
+
+# ----------------------------------------------------
+# OS & Miscellaneous
+# ----------------------------------------------------
+Thumbs.db
+[Dd]esktop.ini
