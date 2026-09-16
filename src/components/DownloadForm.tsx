@@ -1,4 +1,4 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Download,
@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { FormOptions, FormatType, MediaMetadata } from "../types/download";
 import { MediaPreviewCard } from "./MediaPreviewCard";
+import { useClipboardWatcher } from "../hooks/useClipboardWatcher";
 
 interface DownloadFormProps {
   onSubmit: (options: FormOptions) => void;
@@ -29,6 +30,11 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({
   const [isPlaylist, setIsPlaylist] = useState(false);
   const [useGpu, setUseGpu] = useState(true);
   const [savePath, setSavePath] = useState("");
+  const [autoDetectClipboard, setAutoDetectClipboard] = useState(true);
+  const [showClipboardToast, setShowClipboardToast] = useState(false);
+
+  const inputRef = useRef<HTMLInputElement>(null);
+  const clipboardToastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Media preview metadata states
   const [preview, setPreview] = useState<MediaMetadata | null>(null);
@@ -36,7 +42,7 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({
   const lastFetchedUrlRef = useRef<string>("");
   const currentRequestIdRef = useRef<number>(0);
 
-  const fetchPreview = async (targetUrl: string) => {
+  const fetchPreview = useCallback(async (targetUrl: string) => {
     const trimmed = targetUrl.trim();
     if (
       trimmed.length <= 10 ||
@@ -67,7 +73,36 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({
         setIsLoadingPreview(false);
       }
     }
-  };
+  }, []);
+
+  // Handle automatic detection of copied media links
+  const handleAutoDetectedUrl = useCallback(
+    (detectedUrl: string) => {
+      setUrl(detectedUrl);
+      setShowClipboardToast(true);
+
+      if (clipboardToastTimeoutRef.current) {
+        clearTimeout(clipboardToastTimeoutRef.current);
+      }
+      clipboardToastTimeoutRef.current = setTimeout(() => {
+        setShowClipboardToast(false);
+      }, 4000);
+
+      fetchPreview(detectedUrl);
+    },
+    [fetchPreview]
+  );
+
+  // Active clipboard watcher on window focus
+  useClipboardWatcher(handleAutoDetectedUrl, autoDetectClipboard, inputRef);
+
+  useEffect(() => {
+    return () => {
+      if (clipboardToastTimeoutRef.current) {
+        clearTimeout(clipboardToastTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const handlePasteClipboard = async () => {
     try {
@@ -114,6 +149,7 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({
     setUrl("");
     setPreview(null);
     lastFetchedUrlRef.current = "";
+    setShowClipboardToast(false);
   };
 
   const handleClearPreview = () => {
@@ -133,13 +169,25 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({
     <section className="bg-neutral-900/60 border border-neutral-800/80 rounded-2xl p-5 shadow-xl backdrop-blur-sm shrink-0 flex flex-col gap-4">
       <form onSubmit={handleSubmit} className="flex gap-2">
         <div className="relative flex-1">
+          {/* Subtle auto-detected notification badge */}
+          {showClipboardToast && (
+            <div className="absolute -top-3 left-4 px-2.5 py-0.5 rounded-full bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 text-[11px] font-medium backdrop-blur-md shadow-md shadow-indigo-950/40 flex items-center gap-1.5 animate-in fade-in slide-in-from-bottom-1 duration-200 z-10">
+              <Sparkles className="w-3 h-3 text-cyan-300 animate-pulse" />
+              <span>Link detected from clipboard</span>
+            </div>
+          )}
+
           <input
+            ref={inputRef}
             type="text"
             placeholder="Paste media link here (YouTube, Rumble, X, Twitch, Vimeo...)"
             value={url}
             onChange={(e) => {
               const val = e.target.value;
               setUrl(val);
+              if (showClipboardToast) {
+                setShowClipboardToast(false);
+              }
               if (!val.trim()) {
                 setPreview(null);
                 lastFetchedUrlRef.current = "";
@@ -250,8 +298,31 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({
           )}
         </div>
 
-        {/* Options & Destination Folder */}
+        {/* Options, Clipboard Auto-Detect & Destination Folder */}
         <div className="flex items-center gap-4">
+          {/* Clipboard Auto-Detect Switch */}
+          <label
+            className={`flex items-center gap-1.5 cursor-pointer transition-colors ${
+              autoDetectClipboard
+                ? "text-neutral-300 hover:text-neutral-100"
+                : "text-neutral-500 hover:text-neutral-400"
+            }`}
+            title="Automatically populate link and preview when you copy a media URL and switch to Gen Downloader"
+          >
+            <input
+              type="checkbox"
+              checked={autoDetectClipboard}
+              onChange={(e) => setAutoDetectClipboard(e.target.checked)}
+              className="rounded border-neutral-700 bg-neutral-950 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+            />
+            <Clipboard
+              className={`w-3.5 h-3.5 ${
+                autoDetectClipboard ? "text-cyan-400" : "text-neutral-500"
+              }`}
+            />
+            <span>Auto-Detect</span>
+          </label>
+
           {/* Playlist Toggle */}
           <label className="flex items-center gap-2 text-neutral-300 cursor-pointer hover:text-neutral-100 transition-colors">
             <input

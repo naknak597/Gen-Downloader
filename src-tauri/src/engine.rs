@@ -803,7 +803,46 @@ pub fn scan_playlist_directory(dir_path: &str) -> Result<Vec<PlaylistItem>, Stri
 // 5b. Media Preview & Metadata Fetching
 // ---------------------------------------------------------------------------
 
-/// Parses yt-dlp single-json dump into a structured MediaMetadata object
+/// Helper to extract non-empty trimmed string from JSON matching any of candidate keys
+fn extract_json_string(val: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = val.get(*key).and_then(|v| v.as_str()) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Helper to resolve the best thumbnail URL from a JSON object
+fn extract_json_thumbnail(val: &Value) -> Option<String> {
+    if let Some(thumb) = val.get("thumbnail").and_then(|v| v.as_str()) {
+        let trimmed = thumb.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    val.get("thumbnails").and_then(|v| v.as_array()).and_then(|arr| {
+        arr.iter().rev().find_map(|item| {
+            item.get("url")
+                .and_then(|u| u.as_str())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+    })
+}
+
+/// Helper to extract numeric duration from a JSON object
+fn extract_json_duration(val: &Value) -> Option<u64> {
+    val.get("duration")
+        .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|d| d.round() as u64)))
+}
+
+/// Parses yt-dlp single-json dump into a structured MediaMetadata object,
+/// supporting both direct single videos and playlists (_type == "playlist").
 pub fn parse_media_metadata_json(raw_json: &str, fallback_url: &str) -> Result<MediaMetadata, String> {
     let trimmed = raw_json.trim();
     if trimmed.is_empty() {
@@ -826,57 +865,43 @@ pub fn parse_media_metadata_json(raw_json: &str, fallback_url: &str) -> Result<M
         }
     };
 
-    let title = json_val
-        .get("title")
+    let is_playlist = json_val
+        .get("_type")
         .and_then(|v| v.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("Unknown Title")
-        .to_string();
+        .map(|t| t == "playlist" || t == "multi_video")
+        .unwrap_or(false)
+        || json_val.get("entries").is_some();
 
-    // Resolve best thumbnail:
-    // 1. Direct "thumbnail" string property
-    // 2. Or best URL from "thumbnails" array
-    let thumbnail = json_val
-        .get("thumbnail")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            json_val.get("thumbnails").and_then(|v| v.as_array()).and_then(|arr| {
-                arr.iter().rev().find_map(|item| {
-                    item.get("url")
-                        .and_then(|u| u.as_str())
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                })
-            })
-        });
+    let first_entry = if is_playlist {
+        json_val
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.iter().find(|item| !item.is_null()))
+    } else {
+        None
+    };
 
-    let duration = json_val
-        .get("duration")
-        .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|d| d.round() as u64)));
+    // 1. Title: top-level title, or first entry's title, or fallback
+    let title = extract_json_string(&json_val, &["title"])
+        .or_else(|| first_entry.and_then(|e| extract_json_string(e, &["title"])))
+        .unwrap_or_else(|| "Unknown Title".to_string());
 
-    let uploader = json_val
-        .get("uploader")
-        .and_then(|v| v.as_str())
-        .or_else(|| json_val.get("channel").and_then(|v| v.as_str()))
-        .or_else(|| json_val.get("creator").and_then(|v| v.as_str()))
-        .or_else(|| json_val.get("uploader_id").and_then(|v| v.as_str()))
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    // 2. Thumbnail: top-level thumbnail, or first entry's thumbnail
+    let thumbnail = extract_json_thumbnail(&json_val)
+        .or_else(|| first_entry.and_then(extract_json_thumbnail));
 
-    let webpage_url = json_val
-        .get("webpage_url")
-        .and_then(|v| v.as_str())
-        .or_else(|| json_val.get("original_url").and_then(|v| v.as_str()))
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(fallback_url)
-        .to_string();
+    // 3. Duration: top-level or first entry's duration
+    let duration = extract_json_duration(&json_val)
+        .or_else(|| first_entry.and_then(extract_json_duration));
+
+    // 4. Uploader / Channel: top-level or first entry's channel
+    let uploader = extract_json_string(&json_val, &["uploader", "channel", "creator", "uploader_id", "channel_id"])
+        .or_else(|| first_entry.and_then(|e| extract_json_string(e, &["uploader", "channel", "creator", "uploader_id", "channel_id"])));
+
+    // 5. Webpage URL: top-level webpage_url, or first entry's URL, or provided fallback
+    let webpage_url = extract_json_string(&json_val, &["webpage_url", "original_url"])
+        .or_else(|| first_entry.and_then(|e| extract_json_string(e, &["webpage_url", "original_url", "url"])))
+        .unwrap_or_else(|| fallback_url.to_string());
 
     Ok(MediaMetadata {
         title,
@@ -887,7 +912,7 @@ pub fn parse_media_metadata_json(raw_json: &str, fallback_url: &str) -> Result<M
     })
 }
 
-/// Fetches media preview metadata by running yt-dlp with --dump-single-json
+/// Fetches media preview metadata by running yt-dlp with optimized flags and an 8-second timeout
 pub async fn fetch_media_metadata(
     app: &AppHandle,
     url: &str,
@@ -897,39 +922,72 @@ pub async fn fetch_media_metadata(
         return Err("Please provide a valid media URL".to_string());
     }
 
+    // High-performance metadata extraction:
+    // - `--skip-download`: do not fetch media streams
+    // - `--no-playlist`: extract single video if URL has both v= and list=
+    // - `--playlist-items 1`: if pure playlist URL, only extract first item instead of crawling all
+    // - `--no-check-formats`: skip stream format probing (< 2 sec response)
+    // - `--no-warnings` & `--ignore-errors`: suppress non-fatal warnings
     let args = vec![
         "--dump-single-json".to_string(),
-        "--no-download".to_string(),
+        "--skip-download".to_string(),
         "--no-playlist".to_string(),
-        "--flat-playlist".to_string(),
+        "--playlist-items".to_string(),
+        "1".to_string(),
+        "--no-check-formats".to_string(),
         "--no-warnings".to_string(),
+        "--ignore-errors".to_string(),
         trimmed_url.to_string(),
     ];
 
-    let (mut rx, _child) = spawn_ytdlp_process(app, args)?;
+    let (mut rx, child) = spawn_ytdlp_process(app, args)?;
 
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-    let mut exit_code: Option<i32> = None;
+    let timeout_duration = std::time::Duration::from_secs(8);
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            CommandEvent::Stdout(bytes) => {
-                stdout_buf.extend_from_slice(&bytes);
+    let read_result = tokio::time::timeout(timeout_duration, async {
+        let mut stdout_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
+        let mut exit_code: Option<i32> = None;
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Stdout(bytes) => {
+                    stdout_buf.extend_from_slice(&bytes);
+                }
+                CommandEvent::Stderr(bytes) => {
+                    stderr_buf.extend_from_slice(&bytes);
+                }
+                CommandEvent::Error(err) => {
+                    return Err(format!("yt-dlp execution error: {err}"));
+                }
+                CommandEvent::Terminated(payload) => {
+                    exit_code = payload.code;
+                    break;
+                }
+                _ => {}
             }
-            CommandEvent::Stderr(bytes) => {
-                stderr_buf.extend_from_slice(&bytes);
-            }
-            CommandEvent::Error(err) => {
-                return Err(format!("yt-dlp execution error: {err}"));
-            }
-            CommandEvent::Terminated(payload) => {
-                exit_code = payload.code;
-                break;
-            }
-            _ => {}
         }
-    }
+
+        Ok((stdout_buf, stderr_buf, exit_code))
+    })
+    .await;
+
+    let (stdout_buf, stderr_buf, exit_code) = match read_result {
+        Ok(res) => res?,
+        Err(_) => {
+            // Process timed out: terminate child process to prevent lingering resource leaks
+            #[cfg(windows)]
+            {
+                let pid = child.pid();
+                let mut cmd = std::process::Command::new("taskkill");
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+                let _ = cmd.output();
+            }
+            let _ = child.kill();
+            return Err("Metadata request timed out after 8 seconds. Please check the URL or your connection.".to_string());
+        }
+    };
 
     let stdout_str = String::from_utf8_lossy(&stdout_buf);
 
@@ -959,6 +1017,7 @@ pub async fn fetch_media_metadata(
 
     parse_media_metadata_json(&stdout_str, trimmed_url)
 }
+
 
 // ---------------------------------------------------------------------------
 // 6. Unit Tests
@@ -1183,5 +1242,54 @@ mod tests {
         assert_eq!(meta.uploader.as_deref(), Some("Fallback Channel"));
         assert_eq!(meta.webpage_url, "https://fallback.url");
     }
+
+    #[test]
+    fn test_parse_media_metadata_json_playlist() {
+        let sample_playlist_json = r#"{
+            "_type": "playlist",
+            "title": "Best Coding Music 2026",
+            "uploader": "Lofi Beats",
+            "webpage_url": "https://www.youtube.com/playlist?list=PL12345",
+            "entries": [
+                {
+                    "title": "Track 1 - Ambient Flow",
+                    "thumbnail": "https://i.ytimg.com/vi/track1/hqdefault.jpg",
+                    "duration": 180,
+                    "uploader": "Lofi Producer",
+                    "webpage_url": "https://www.youtube.com/watch?v=track1"
+                }
+            ]
+        }"#;
+
+        let meta = parse_media_metadata_json(sample_playlist_json, "https://fallback.url").unwrap();
+        assert_eq!(meta.title, "Best Coding Music 2026");
+        assert_eq!(meta.thumbnail.as_deref(), Some("https://i.ytimg.com/vi/track1/hqdefault.jpg"));
+        assert_eq!(meta.duration, Some(180));
+        assert_eq!(meta.uploader.as_deref(), Some("Lofi Beats"));
+        assert_eq!(meta.webpage_url, "https://www.youtube.com/playlist?list=PL12345");
+    }
+
+    #[test]
+    fn test_parse_media_metadata_json_playlist_entry_fallback() {
+        let sample_playlist_json = r#"{
+            "_type": "playlist",
+            "entries": [
+                {
+                    "title": "First Video In Anonymous Playlist",
+                    "thumbnail": "https://i.ytimg.com/vi/first/hqdefault.jpg",
+                    "duration": 240,
+                    "channel": "Awesome Creator"
+                }
+            ]
+        }"#;
+
+        let meta = parse_media_metadata_json(sample_playlist_json, "https://fallback.url").unwrap();
+        assert_eq!(meta.title, "First Video In Anonymous Playlist");
+        assert_eq!(meta.thumbnail.as_deref(), Some("https://i.ytimg.com/vi/first/hqdefault.jpg"));
+        assert_eq!(meta.duration, Some(240));
+        assert_eq!(meta.uploader.as_deref(), Some("Awesome Creator"));
+        assert_eq!(meta.webpage_url, "https://fallback.url");
+    }
 }
+
 
