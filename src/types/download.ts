@@ -7,7 +7,8 @@ export type TaskStatus =
 
 export type FormatType = "video" | "audio";
 
-export type FilterTab = "all" | "active" | "completed";
+export type TaskFilter = "all" | "active" | "completed" | "failed";
+export type FilterTab = TaskFilter;
 
 export interface DownloadProgressEvent {
   task_id: string;

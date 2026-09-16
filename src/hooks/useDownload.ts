@@ -159,9 +159,7 @@ export function useDownload() {
   }, []);
 
   const clearCompleted = useCallback(() => {
-    setTasks((prev) =>
-      prev.filter((t) => t.status === "Downloading" || t.status === "Processing/GPU")
-    );
+    setTasks((prev) => prev.filter((t) => t.status !== "Completed"));
   }, []);
 
   const activeCount = tasks.filter(
