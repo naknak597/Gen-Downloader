@@ -2,10 +2,20 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { DownloadTask, DownloadProgressEvent, FormOptions } from "../types/download";
+import {
+  ensureNotificationPermission,
+  notifyTaskComplete,
+  notifyTaskFailed,
+} from "../utils/notifications";
 
 export function useDownload() {
   const [tasks, setTasks] = useState<DownloadTask[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Request notification permissions once on component mount
+  useEffect(() => {
+    ensureNotificationPermission();
+  }, []);
 
   // ---------------------------------------------------------------------------
   // 1. Tauri Real-Time Progress Event Listener
@@ -26,6 +36,16 @@ export function useDownload() {
                   // Do not let late progress events overwrite a user-cancelled task
                   if (task.status === "Cancelled" && data.status !== "Cancelled") {
                     return task;
+                  }
+
+                  // Alert user with chime + toast on completion or failure
+                  if (data.status === "Completed" && task.status !== "Completed") {
+                    notifyTaskComplete(data.filename || task.filename, task.isPlaylist);
+                  } else if (data.status === "Error" && task.status !== "Error") {
+                    notifyTaskFailed(
+                      data.filename || task.filename,
+                      data.error_log || undefined
+                    );
                   }
 
                   return {
@@ -114,10 +134,12 @@ export function useDownload() {
       }
     } catch (err) {
       console.error("Failed to start download:", err);
+      const errMsg = String(err);
+      notifyTaskFailed(targetUrl, errMsg);
       setTasks((prev) =>
         prev.map((t) =>
           t.taskId === tempTaskId
-            ? { ...t, status: "Error", filename: String(err), errorLog: String(err) }
+            ? { ...t, status: "Error", filename: errMsg, errorLog: errMsg }
             : t
         )
       );
