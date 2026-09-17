@@ -82,7 +82,9 @@ export const TaskCard: React.FC<TaskCardProps> = ({
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
             <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-neutral-900 border border-neutral-800 text-neutral-300 shrink-0">
-              {task.formatType === "audio" ? (
+              {["mp3", "m4a", "wav", "flac", "aac", "opus", "audio"].includes(
+                task.formatType.toLowerCase()
+              ) ? (
                 <Music className="w-4 h-4 text-purple-400" />
               ) : (
                 <Video className="w-4 h-4 text-cyan-400" />
@@ -270,6 +272,8 @@ export const TaskCard: React.FC<TaskCardProps> = ({
                 <span>•</span>
               </>
             )}
+            <span>{task.formatType.toUpperCase()}</span>
+            <span>•</span>
             <span>{task.quality.toUpperCase()}</span>
             <span>•</span>
             <span>{task.createdAt}</span>

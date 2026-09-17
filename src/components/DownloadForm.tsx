@@ -10,28 +10,46 @@ import {
   Layers,
   RefreshCw,
   FolderCheck,
+  Subtitles,
+  Image as ImageIcon,
+  FileText,
+  Shield,
 } from "lucide-react";
-import { FormOptions, FormatType, MediaMetadata } from "../types/download";
+import {
+  FormOptions,
+  MediaMetadata,
+  VideoFormat,
+  AudioFormat,
+  MediaFormat,
+} from "../types/download";
 import { MediaPreviewCard } from "./MediaPreviewCard";
 import { useClipboardWatcher } from "../hooks/useClipboardWatcher";
 
 interface DownloadFormProps {
-  onSubmit: (options: FormOptions) => void;
+  onSubmit?: (options: FormOptions) => void;
+  onStartDownload?: (options: FormOptions) => void;
   isSubmitting: boolean;
 }
 
 export const DownloadForm: React.FC<DownloadFormProps> = ({
   onSubmit,
+  onStartDownload,
   isSubmitting,
 }) => {
   const [url, setUrl] = useState("");
-  const [formatType, setFormatType] = useState<FormatType>("video");
+  const [mediaMode, setMediaMode] = useState<"video" | "audio">("video");
+  const [videoFormat, setVideoFormat] = useState<VideoFormat>("mp4");
+  const [audioFormat, setAudioFormat] = useState<AudioFormat>("mp3");
   const [quality, setQuality] = useState("1080p");
   const [isPlaylist, setIsPlaylist] = useState(false);
   const [useGpu, setUseGpu] = useState(true);
   const [savePath, setSavePath] = useState("");
   const [autoDetectClipboard, setAutoDetectClipboard] = useState(true);
   const [showClipboardToast, setShowClipboardToast] = useState(false);
+  const [downloadSubtitle, setDownloadSubtitle] = useState(false);
+  const [downloadThumbnail, setDownloadThumbnail] = useState(false);
+  const [downloadMetadata, setDownloadMetadata] = useState(false);
+  const [browserCookies, setBrowserCookies] = useState("");
 
   const inputRef = useRef<HTMLInputElement>(null);
   const clipboardToastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -40,40 +58,49 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({
   const [preview, setPreview] = useState<MediaMetadata | null>(null);
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
   const lastFetchedUrlRef = useRef<string>("");
+  const lastFetchedCookieRef = useRef<string>("");
   const currentRequestIdRef = useRef<number>(0);
 
-  const fetchPreview = useCallback(async (targetUrl: string) => {
-    const trimmed = targetUrl.trim();
-    if (
-      trimmed.length <= 10 ||
-      !/^https?:\/\//i.test(trimmed) ||
-      trimmed === lastFetchedUrlRef.current
-    ) {
-      return;
-    }
+  const fetchPreview = useCallback(
+    async (targetUrl: string, cookieOverride?: string) => {
+      const trimmed = targetUrl.trim();
+      const effectiveCookie =
+        cookieOverride !== undefined ? cookieOverride : browserCookies;
+      if (
+        trimmed.length <= 10 ||
+        !/^https?:\/\//i.test(trimmed) ||
+        (trimmed === lastFetchedUrlRef.current &&
+          effectiveCookie === lastFetchedCookieRef.current)
+      ) {
+        return;
+      }
 
-    lastFetchedUrlRef.current = trimmed;
-    const requestId = ++currentRequestIdRef.current;
-    setIsLoadingPreview(true);
+      lastFetchedUrlRef.current = trimmed;
+      lastFetchedCookieRef.current = effectiveCookie;
+      const requestId = ++currentRequestIdRef.current;
+      setIsLoadingPreview(true);
 
-    try {
-      const data = await invoke<MediaMetadata>("get_media_info", {
-        url: trimmed,
-      });
-      if (requestId === currentRequestIdRef.current) {
-        setPreview(data);
+      try {
+        const data = await invoke<MediaMetadata>("get_media_info", {
+          url: trimmed,
+          cookies: effectiveCookie || undefined,
+        });
+        if (requestId === currentRequestIdRef.current) {
+          setPreview(data);
+        }
+      } catch (err) {
+        if (requestId === currentRequestIdRef.current) {
+          console.warn("Failed to fetch media metadata:", err);
+          setPreview(null);
+        }
+      } finally {
+        if (requestId === currentRequestIdRef.current) {
+          setIsLoadingPreview(false);
+        }
       }
-    } catch (err) {
-      if (requestId === currentRequestIdRef.current) {
-        console.warn("Failed to fetch media metadata:", err);
-        setPreview(null);
-      }
-    } finally {
-      if (requestId === currentRequestIdRef.current) {
-        setIsLoadingPreview(false);
-      }
-    }
-  }, []);
+    },
+    [browserCookies]
+  );
 
   // Handle automatic detection of copied media links
   const handleAutoDetectedUrl = useCallback(
@@ -137,18 +164,27 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({
     e.preventDefault();
     if (!url.trim() || isSubmitting) return;
 
-    onSubmit({
+    const submitHandler = onStartDownload || onSubmit;
+    const activeFormat = (mediaMode === "video" ? videoFormat : audioFormat).toLowerCase() as MediaFormat;
+    const resolvedQuality = mediaMode === "video" ? quality.trim() : "best";
+
+    submitHandler?.({
       url: url.trim(),
-      formatType,
-      quality,
+      formatType: activeFormat,
+      quality: resolvedQuality,
       isPlaylist,
       useGpu,
       savePath,
+      downloadSubtitle,
+      downloadThumbnail,
+      downloadMetadata,
+      browserCookies: browserCookies || undefined,
     });
 
     setUrl("");
     setPreview(null);
     lastFetchedUrlRef.current = "";
+    lastFetchedCookieRef.current = "";
     setShowClipboardToast(false);
   };
 
@@ -250,38 +286,69 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({
 
       {/* Configuration Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-4 pt-1 border-t border-neutral-800/60 text-xs">
-        {/* Format & Quality */}
-        <div className="flex items-center gap-3">
-          {/* Video / Audio Switcher */}
+        {/* Format, Quality & Asset Toggles */}
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Mode Switcher: Video vs Audio */}
           <div className="flex p-1 bg-neutral-950/80 border border-neutral-800 rounded-xl">
             <button
               type="button"
-              onClick={() => setFormatType("video")}
+              onClick={() => setMediaMode("video")}
               className={`px-3 py-1.5 rounded-lg font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
-                formatType === "video"
+                mediaMode === "video"
                   ? "bg-neutral-800 text-cyan-400 shadow-sm"
                   : "text-neutral-400 hover:text-neutral-200"
               }`}
             >
               <Video className="w-3.5 h-3.5" />
-              <span>Video (MP4)</span>
+              <span>Video</span>
             </button>
             <button
               type="button"
-              onClick={() => setFormatType("audio")}
+              onClick={() => setMediaMode("audio")}
               className={`px-3 py-1.5 rounded-lg font-medium flex items-center gap-1.5 transition-all cursor-pointer ${
-                formatType === "audio"
+                mediaMode === "audio"
                   ? "bg-neutral-800 text-purple-400 shadow-sm"
                   : "text-neutral-400 hover:text-neutral-200"
               }`}
             >
               <Music className="w-3.5 h-3.5" />
-              <span>Audio (MP3)</span>
+              <span>Audio</span>
             </button>
           </div>
 
-          {/* Quality Dropdown */}
-          {formatType === "video" && (
+          {/* Format Selector Dropdown */}
+          <div className="flex items-center gap-2">
+            <span className="text-neutral-400 font-medium">Format:</span>
+            {mediaMode === "video" ? (
+              <select
+                value={videoFormat}
+                onChange={(e) => setVideoFormat(e.target.value.toLowerCase() as VideoFormat)}
+                className="bg-neutral-950/80 border border-neutral-800 rounded-xl px-3 py-1.5 text-neutral-200 text-xs focus:outline-none focus:border-indigo-500 cursor-pointer font-medium"
+              >
+                <option value="mp4">MP4 (.mp4)</option>
+                <option value="mkv">MKV (.mkv)</option>
+                <option value="webm">WebM (.webm)</option>
+                <option value="mov">MOV (.mov)</option>
+                <option value="avi">AVI (.avi)</option>
+              </select>
+            ) : (
+              <select
+                value={audioFormat}
+                onChange={(e) => setAudioFormat(e.target.value.toLowerCase() as AudioFormat)}
+                className="bg-neutral-950/80 border border-neutral-800 rounded-xl px-3 py-1.5 text-neutral-200 text-xs focus:outline-none focus:border-indigo-500 cursor-pointer font-medium"
+              >
+                <option value="mp3">MP3 (.mp3)</option>
+                <option value="m4a">M4A (.m4a)</option>
+                <option value="wav">WAV (.wav)</option>
+                <option value="flac">FLAC (.flac)</option>
+                <option value="aac">AAC (.aac)</option>
+                <option value="opus">OPUS (.opus)</option>
+              </select>
+            )}
+          </div>
+
+          {/* Quality Dropdown (Video Only) */}
+          {mediaMode === "video" && (
             <div className="flex items-center gap-2">
               <span className="text-neutral-400 font-medium">Quality:</span>
               <select
@@ -296,6 +363,106 @@ export const DownloadForm: React.FC<DownloadFormProps> = ({
               </select>
             </div>
           )}
+
+          {/* Subtitles (.srt) Toggle */}
+          <label
+            className="flex items-center gap-1.5 bg-neutral-950/80 border border-neutral-800 rounded-xl px-2.5 py-1.5 cursor-pointer text-neutral-300 hover:text-neutral-100 transition-colors"
+            title="Download synchronized original spoken language subtitles (.srt)"
+          >
+            <input
+              type="checkbox"
+              checked={downloadSubtitle}
+              onChange={(e) => setDownloadSubtitle(e.target.checked)}
+              className="rounded border-neutral-700 bg-neutral-950 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+            />
+            <Subtitles
+              className={`w-3.5 h-3.5 ${
+                downloadSubtitle ? "text-cyan-400" : "text-neutral-500"
+              }`}
+            />
+            <span className="font-medium">Subtitles (.srt)</span>
+          </label>
+
+          {/* HD Thumbnail (.jpg) Toggle */}
+          <label
+            className="flex items-center gap-1.5 bg-neutral-950/80 border border-neutral-800 rounded-xl px-2.5 py-1.5 cursor-pointer text-neutral-300 hover:text-neutral-100 transition-colors"
+            title="Download high-definition cover thumbnail (.jpg)"
+          >
+            <input
+              type="checkbox"
+              checked={downloadThumbnail}
+              onChange={(e) => setDownloadThumbnail(e.target.checked)}
+              className="rounded border-neutral-700 bg-neutral-950 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+            />
+            <ImageIcon
+              className={`w-3.5 h-3.5 ${
+                downloadThumbnail ? "text-cyan-400" : "text-neutral-500"
+              }`}
+            />
+            <span className="font-medium">HD Thumbnail (.jpg)</span>
+          </label>
+
+          {/* Video Metadata (.txt) Toggle */}
+          <label
+            className="flex items-center gap-1.5 bg-neutral-950/80 border border-neutral-800 rounded-xl px-2.5 py-1.5 cursor-pointer text-neutral-300 hover:text-neutral-100 transition-colors"
+            title="Export title, description, and keywords into a clean .txt file"
+          >
+            <input
+              type="checkbox"
+              checked={downloadMetadata}
+              onChange={(e) => setDownloadMetadata(e.target.checked)}
+              className="rounded border-neutral-700 bg-neutral-950 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+            />
+            <FileText
+              className={`w-3.5 h-3.5 ${
+                downloadMetadata ? "text-cyan-400" : "text-neutral-500"
+              }`}
+            />
+            <span className="font-medium">Metadata (.txt)</span>
+          </label>
+
+          {/* Browser Cookies Selector */}
+          <div
+            className={`flex items-center gap-1.5 bg-neutral-950/80 border rounded-xl px-2.5 py-1.5 transition-colors ${
+              browserCookies
+                ? "border-amber-500/50 text-amber-300 shadow-sm shadow-amber-950/20"
+                : "border-neutral-800 text-neutral-300 hover:text-neutral-100"
+            }`}
+            title="Import cookies from installed browser for age-restricted or login-gated videos"
+          >
+            <Shield
+              className={`w-3.5 h-3.5 ${
+                browserCookies ? "text-amber-400" : "text-neutral-500"
+              }`}
+            />
+            <select
+              value={browserCookies}
+              onChange={(e) => {
+                const nextVal = e.target.value;
+                setBrowserCookies(nextVal);
+                if (url.trim().length > 10) {
+                  fetchPreview(url.trim(), nextVal);
+                }
+              }}
+              className="bg-transparent text-xs font-semibold focus:outline-none cursor-pointer text-neutral-200"
+            >
+              <option value="" className="bg-neutral-900 text-neutral-300">
+                No Cookies
+              </option>
+              <option value="chrome" className="bg-neutral-900 text-neutral-200">
+                Chrome
+              </option>
+              <option value="edge" className="bg-neutral-900 text-neutral-200">
+                Edge
+              </option>
+              <option value="firefox" className="bg-neutral-900 text-neutral-200">
+                Firefox
+              </option>
+              <option value="brave" className="bg-neutral-900 text-neutral-200">
+                Brave
+              </option>
+            </select>
+          </div>
         </div>
 
         {/* Options, Clipboard Auto-Detect & Destination Folder */}

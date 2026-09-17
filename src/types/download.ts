@@ -5,7 +5,10 @@ export type TaskStatus =
   | "Error"
   | "Cancelled";
 
-export type FormatType = "video" | "audio";
+export type VideoFormat = "mp4" | "mkv" | "webm" | "mov" | "avi";
+export type AudioFormat = "mp3" | "m4a" | "wav" | "flac" | "aac" | "opus";
+export type MediaFormat = VideoFormat | AudioFormat;
+export type FormatType = "video" | "audio" | MediaFormat;
 
 export type TaskFilter = "all" | "active" | "completed" | "failed";
 export type FilterTab = TaskFilter;
@@ -55,6 +58,28 @@ export interface FormOptions {
   isPlaylist: boolean;
   useGpu: boolean;
   savePath: string;
+  downloadSubtitle?: boolean;
+  subtitleLang?: string;
+  downloadThumbnail?: boolean;
+  downloadMetadata?: boolean;
+  browserCookies?: string;
+}
+
+export interface DownloadPayload {
+  task_id?: string | null;
+  url: string;
+  format_type: FormatType;
+  quality: string;
+  is_playlist: boolean;
+  use_gpu: boolean;
+  save_path?: string | null;
+  download_subtitle?: boolean;
+  subtitle_lang?: string | null;
+  download_thumbnail?: boolean;
+  download_metadata?: boolean;
+  downloadMetadata?: boolean;
+  browser_cookies?: string | null;
+  browserCookies?: string;
 }
 
 export interface MediaMetadata {
@@ -63,5 +88,14 @@ export interface MediaMetadata {
   duration?: number;
   uploader?: string;
   webpageUrl: string;
+  availableSubtitles?: string[];
+  description?: string;
+  tags?: string[];
 }
+
+export interface CoreVersions {
+  ytdlpVersion: string;
+  ffmpegVersion: string;
+}
+
 

@@ -522,8 +522,8 @@ pub fn build_output_template(clean_save_path: &str, is_playlist: bool) -> String
     }
 }
 
-/// Pure argument builder for yt-dlp execution
-pub fn build_arguments(app: &AppHandle, payload: &DownloadPayload) -> Vec<String> {
+/// Internal pure argument builder for yt-dlp execution
+pub fn build_arguments_internal(ffmpeg_path_opt: Option<String>, payload: &DownloadPayload) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--newline".into(),
         "--no-colors".into(),
@@ -533,11 +533,10 @@ pub fn build_arguments(app: &AppHandle, payload: &DownloadPayload) -> Vec<String
         "download-progress:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.filename)s".into(),
         // Strictly ensure intermediate stream files are deleted after muxing
         "--no-keep-video".into(),
+        "--no-warnings".into(),
         // Utilize system Node.js runtime for JavaScript challenge & signature solving
         "--js-runtimes".into(),
         "node".into(),
-        "--compat-options".into(),
-        "no-keep-subs".into(),
     ];
 
     // Playlist handling & error resilience for unavailable items
@@ -550,45 +549,145 @@ pub fn build_arguments(app: &AppHandle, payload: &DownloadPayload) -> Vec<String
     }
 
     // Pass resolved absolute FFmpeg location
-    let ffmpeg_path_opt = resolve_ffmpeg_path(Some(app));
     if let Some(ref ffmpeg_path) = ffmpeg_path_opt {
         args.push("--ffmpeg-location".into());
         args.push(ffmpeg_path.clone());
     }
 
+    // Browser Cookies handling for age-restricted / login-gated videos
+    if let Some(ref browser) = payload.browser_cookies {
+        let browser_trimmed = browser.trim();
+        if !browser_trimmed.is_empty() {
+            args.push("--cookies-from-browser".into());
+            args.push(browser_trimmed.to_string());
+            if !args.iter().any(|a| a == "--compat-options") {
+                args.push("--compat-options".into());
+                args.push("no-keep-subs".into());
+            }
+        }
+    }
+
+    // Subtitle download handling: strictly original spoken language (creator or auto-caption)
+    if payload.download_subtitle {
+        args.push("--write-subs".into());
+        args.push("--write-auto-subs".into());
+        args.push("--sub-langs".into());
+        args.push("orig,.*-orig,default,km.*,en.*".into());
+        args.push("--convert-subs".into());
+        args.push("srt".into());
+        if !args.iter().any(|a| a == "--compat-options") {
+            args.push("--compat-options".into());
+            args.push("no-keep-subs".into());
+        }
+
+        // 1. Bypass YouTube TimedText Rate Limits (HTTP Error 429: Too Many Requests)
+        args.push("--sleep-subtitles".into());
+        args.push("2".into());
+
+        // 2. Prevent Subtitle Errors from Killing the Entire Download
+        args.push("--no-abort-on-error".into());
+        args.push("--ignore-no-formats-error".into());
+
+        // 3. Retry Strategy: handle temporary 429 hiccups gracefully
+        args.push("--extractor-retries".into());
+        args.push("3".into());
+        args.push("--retry-sleep".into());
+        args.push("extractor:3".into());
+    }
+
+    // HD Thumbnail download handling (converted to .jpg)
+    if payload.download_thumbnail {
+        args.push("--write-thumbnail".into());
+        args.push("--convert-thumbnails".into());
+        args.push("jpg".into());
+    }
+
+    // Video Metadata .txt export handling (write intermediate .info.json)
+    if payload.download_metadata {
+        args.push("--write-info-json".into());
+    }
+
     // Format & Transcoding Flags
-    if payload.format_type.to_lowercase() == "audio" {
-        // High quality MP3 extraction cleanly removing source container
+    if payload.is_audio() {
+        let raw_audio_fmt = payload.format_type.to_lowercase();
+        let audio_fmt = if raw_audio_fmt == "audio" || raw_audio_fmt.trim().is_empty() {
+            payload.resolved_audio_ext().to_string()
+        } else {
+            raw_audio_fmt
+        };
+
+        // High quality audio extraction cleanly removing source container
         args.push("-x".into());
         args.push("--audio-format".into());
-        args.push("mp3".into());
+        args.push(audio_fmt.clone());
         args.push("--audio-quality".into());
         args.push("0".into());
+
+        // Ensure FFmpeg encodes with the native AAC codec cleanly
+        if audio_fmt == "aac" {
+            args.push("--postprocessor-args".into());
+            args.push("ExtractAudio:-c:a aac".into());
+        }
+
         // Safe non-interactive FFmpeg parameters preventing stdin hangs
         args.push("--postprocessor-args".into());
         args.push("ffmpeg:-nostdin -y".into());
     } else {
-        // Video (MP4) format selector: Prioritize native compatible H.264 (avc1) + AAC (mp4a)
-        // streams, gracefully falling back to highest available resolution
-        let format_selector = match payload.quality.to_lowercase().as_str() {
-            "4k" => "bestvideo[height<=2160][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]",
-            "1080p" => "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-            "720p" => "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
-            _ => "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo+bestaudio/best",
+        let video_ext = payload.resolved_video_ext();
+        let q = payload.quality.trim().to_lowercase();
+        let max_h = match q.as_str() {
+            "4k" | "2160p" | "2160" => "2160",
+            "1080p" | "1080" => "1080",
+            "720p" | "720" => "720",
+            _ => "best",
+        };
+
+        let format_selector = if max_h != "best" {
+            format!("bestvideo[height<={max_h}]+bestaudio/best[height<={max_h}]/best")
+        } else {
+            "bestvideo+bestaudio/best".to_string()
         };
         args.push("-f".into());
-        args.push(format_selector.into());
+        args.push(format_selector);
 
-        // Fast direct container remux into mp4 (stream copy without slow re-encoding)
-        args.push("--merge-output-format".into());
-        args.push("mp4".into());
+        // Dynamically handle container constraints:
+        // - MKV: fast remux via --merge-output-format mkv (accepts VP9, AV1, H264, Opus, AAC without recoding)
+        // - WebM: fast remux via --merge-output-format webm (YouTube natively streams VP9 + Opus in WebM, DO NOT recode)
+        // - MP4: merge output format mp4 and transcode audio to AAC if source is Opus for universal compatibility
+        // - MOV / AVI: transcode streams via --recode-video into container-compliant codecs
+        match video_ext {
+            "mkv" => {
+                args.push("--merge-output-format".into());
+                args.push("mkv".into());
+            }
+            "webm" => {
+                args.push("--merge-output-format".into());
+                args.push("webm".into());
+            }
+            "mp4" => {
+                args.push("--merge-output-format".into());
+                args.push("mp4".into());
+                args.push("--postprocessor-args".into());
+                args.push("Merger:-c:a aac -b:a 192k".into());
+            }
+            "mov" | "avi" => {
+                args.push("--recode-video".into());
+                args.push(video_ext.into());
+            }
+            _ => {
+                args.push("--merge-output-format".into());
+                args.push("mp4".into());
+            }
+        }
 
         // Safe non-interactive FFmpeg postprocessor parameters preventing stdin hangs & overwrite prompts
         args.push("--postprocessor-args".into());
         args.push("ffmpeg:-nostdin -y".into());
 
-        // If GPU acceleration is requested for non-MP4 formats (WebM/VP9), pass NVENC to VideoConvertor only
+        // Ensure GPU postprocessor flags only apply to compatible formats (e.g. MOV hardware encoding)
+        // and do NOT conflict with WebM (which requires VP9/Opus, rejecting H.264 NVENC) or AVI
         let can_use_nvenc = payload.use_gpu
+            && video_ext == "mov"
             && ffmpeg_path_opt
                 .as_ref()
                 .map(|p| is_nvenc_functional(p))
@@ -601,7 +700,10 @@ pub fn build_arguments(app: &AppHandle, payload: &DownloadPayload) -> Vec<String
     }
 
     // Save path & Output filename template
-    let (_, clean_save_path) = resolve_safe_save_path(app, payload.save_path.as_deref());
+    let clean_save_path = match payload.save_path.as_deref() {
+        Some(p) if !p.trim().is_empty() => p.trim().replace('\\', "/").trim_end_matches('/').to_string(),
+        _ => ".".to_string(),
+    };
     let output_template = build_output_template(&clean_save_path, payload.is_playlist);
 
     args.push("-o".into());
@@ -611,6 +713,16 @@ pub fn build_arguments(app: &AppHandle, payload: &DownloadPayload) -> Vec<String
     args.push(payload.url.clone());
 
     args
+}
+
+/// Pure argument builder for yt-dlp execution
+pub fn build_arguments(app: &AppHandle, payload: &DownloadPayload) -> Vec<String> {
+    let (target_dir, _) = resolve_safe_save_path(app, payload.save_path.as_deref());
+    let mut payload_with_safe_path = payload.clone();
+    payload_with_safe_path.save_path = Some(target_dir.to_string_lossy().to_string());
+
+    let ffmpeg_path_opt = resolve_ffmpeg_path(Some(app));
+    build_arguments_internal(ffmpeg_path_opt, &payload_with_safe_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -679,14 +791,130 @@ pub fn natural_sort_key(s: &str) -> Vec<NaturalKeyPart> {
     parts
 }
 
-/// Scans a directory for downloaded media files (.mp4, .mp3, .m4a, .webm, .mkv, .wav),
+/// Reads the yt-dlp `.info.json` file, extracts title, keywords/tags, and description,
+/// formats and writes them into a clean UTF-8 `.txt` file, and deletes the intermediate `.info.json`.
+pub fn export_metadata_txt(json_path: &Path, output_txt_path: &Path) -> Result<(), String> {
+    let content = std::fs::read_to_string(json_path)
+        .map_err(|e| format!("Failed to read metadata JSON from {}: {e}", json_path.display()))?;
+
+    let json_val: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse metadata JSON from {}: {e}", json_path.display()))?;
+
+    let title = json_val
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("N/A");
+
+    let tags_str = if let Some(tags_arr) = json_val.get("tags").and_then(|t| t.as_array()) {
+        let tags: Vec<&str> = tags_arr.iter().filter_map(|t| t.as_str()).collect();
+        if tags.is_empty() {
+            "None".to_string()
+        } else {
+            tags.join(", ")
+        }
+    } else {
+        "None".to_string()
+    };
+
+    let description = json_val
+        .get("description")
+        .and_then(|d| d.as_str())
+        .unwrap_or("");
+
+    let formatted_content = format!(
+"==================================================
+TITLE
+==================================================
+{title}
+
+==================================================
+KEYWORDS / TAGS
+==================================================
+{tags_str}
+
+==================================================
+DESCRIPTION
+==================================================
+{description}
+"
+    );
+
+    std::fs::write(output_txt_path, formatted_content.as_bytes())
+        .map_err(|e| format!("Failed to write metadata text file to {}: {e}", output_txt_path.display()))?;
+
+    // Delete intermediate .info.json file to keep folder clean
+    if let Err(e) = std::fs::remove_file(json_path) {
+        eprintln!(
+            "[metadata] Notice: could not remove intermediate JSON file {}: {e}",
+            json_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+/// Scans target download directory and converts any generated `.info.json` files to `.txt`
+pub fn process_downloaded_metadata(target_dir: &Path, final_file_path: Option<&str>) {
+    // 1. Direct file stem resolution if a specific destination path is known
+    if let Some(file_str) = final_file_path {
+        let p = Path::new(file_str);
+        if let Some(parent) = p.parent() {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                let candidate_json = parent.join(format!("{stem}.info.json"));
+                if candidate_json.exists() {
+                    let txt_path = parent.join(format!("{stem}.txt"));
+                    let _ = export_metadata_txt(&candidate_json, &txt_path);
+                }
+            }
+        }
+    }
+
+    // 2. Scan directory (and 1 level of subdirectories) for all *.info.json files
+    let scan_dir = |dir: &Path| {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if name.ends_with(".info.json") {
+                            let base = &name[..name.len() - ".info.json".len()];
+                            let txt_path = path.with_file_name(format!("{base}.txt"));
+                            let _ = export_metadata_txt(&path, &txt_path);
+                        }
+                    }
+                } else if path.is_dir() {
+                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                        for sub_entry in sub_entries.flatten() {
+                            let sub_path = sub_entry.path();
+                            if sub_path.is_file() {
+                                if let Some(sub_name) = sub_path.file_name().and_then(|n| n.to_str()) {
+                                    if sub_name.ends_with(".info.json") {
+                                        let base = &sub_name[..sub_name.len() - ".info.json".len()];
+                                        let txt_path = sub_path.with_file_name(format!("{base}.txt"));
+                                        let _ = export_metadata_txt(&sub_path, &txt_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    scan_dir(target_dir);
+}
+
+/// Scans a directory for downloaded media files (.mp4, .mkv, .webm, .mov, .avi, .mp3, .m4a, .wav, .flac, .aac, .opus),
 /// extracts clean file metadata, and sorts files in natural track order.
 pub fn scan_playlist_directory(dir_path: &str) -> Result<Vec<PlaylistItem>, String> {
     let raw_path = dir_path.trim().replace('/', "\\");
     let raw_clean = raw_path.trim_end_matches('\\');
     let path = Path::new(raw_clean);
 
-    let allowed_extensions = ["mp4", "mp3", "m4a", "webm", "mkv", "wav"];
+    let allowed_extensions = [
+        "mp4", "mkv", "webm", "mov", "avi", "mp3", "m4a", "wav", "flac", "aac", "opus",
+    ];
 
     // 1. Robust directory resolution:
     // If the path is a file, ends with a known media extension, or doesn't exist but its parent does,
@@ -841,6 +1069,64 @@ fn extract_json_duration(val: &Value) -> Option<u64> {
         .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|d| d.round() as u64)))
 }
 
+/// Sorts and prioritizes subtitle language codes:
+/// 1. "km" (Khmer)
+/// 2. "km-orig" (Khmer Original)
+/// 3. "en" (English)
+/// 4. English variants ("en-US", "en-GB", etc.)
+/// 5. Remaining languages in alphabetical order
+pub fn sort_and_prioritize_subtitles(mut langs: Vec<String>) -> Vec<String> {
+    langs.sort_by(|a, b| {
+        let rank = |s: &str| -> usize {
+            match s {
+                "km" => 0,
+                "km-orig" => 1,
+                "en" => 2,
+                l if l.starts_with("en-") || l.starts_with("en.") || l.starts_with("en_") => 3,
+                _ => 4,
+            }
+        };
+        rank(a).cmp(&rank(b)).then_with(|| a.cmp(b))
+    });
+    langs.dedup();
+    langs
+}
+
+/// Helper to extract unique, prioritized subtitle languages from JSON (both manual and auto captions)
+pub fn extract_available_subtitles(val: &Value) -> Vec<String> {
+    let mut langs = std::collections::HashSet::new();
+
+    let mut collect_keys = |container: &Value| {
+        if let Some(obj) = container.get("subtitles").and_then(|v| v.as_object()) {
+            for k in obj.keys() {
+                let trimmed = k.trim();
+                if !trimmed.is_empty() {
+                    langs.insert(trimmed.to_string());
+                }
+            }
+        }
+        if let Some(obj) = container.get("automatic_captions").and_then(|v| v.as_object()) {
+            for k in obj.keys() {
+                let trimmed = k.trim();
+                if !trimmed.is_empty() {
+                    langs.insert(trimmed.to_string());
+                }
+            }
+        }
+    };
+
+    collect_keys(val);
+
+    if let Some(entries) = val.get("entries").and_then(|v| v.as_array()) {
+        for entry in entries.iter().take(5) {
+            collect_keys(entry);
+        }
+    }
+
+    let list: Vec<String> = langs.into_iter().collect();
+    sort_and_prioritize_subtitles(list)
+}
+
 /// Parses yt-dlp single-json dump into a structured MediaMetadata object,
 /// supporting both direct single videos and playlists (_type == "playlist").
 pub fn parse_media_metadata_json(raw_json: &str, fallback_url: &str) -> Result<MediaMetadata, String> {
@@ -903,12 +1189,30 @@ pub fn parse_media_metadata_json(raw_json: &str, fallback_url: &str) -> Result<M
         .or_else(|| first_entry.and_then(|e| extract_json_string(e, &["webpage_url", "original_url", "url"])))
         .unwrap_or_else(|| fallback_url.to_string());
 
+    // 6. Subtitles: extract available subtitle languages from subtitles and automatic_captions
+    let available_subtitles = extract_available_subtitles(&json_val);
+
+    // 7. Description & Tags
+    let description = extract_json_string(&json_val, &["description"])
+        .or_else(|| first_entry.and_then(|e| extract_json_string(e, &["description"])));
+    let tags = json_val
+        .get("tags")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>()
+        });
+
     Ok(MediaMetadata {
         title,
         thumbnail,
         duration,
         uploader,
         webpage_url,
+        available_subtitles,
+        description,
+        tags,
     })
 }
 
@@ -916,6 +1220,7 @@ pub fn parse_media_metadata_json(raw_json: &str, fallback_url: &str) -> Result<M
 pub async fn fetch_media_metadata(
     app: &AppHandle,
     url: &str,
+    cookies: Option<&str>,
 ) -> Result<MediaMetadata, String> {
     let trimmed_url = url.trim();
     if trimmed_url.is_empty() {
@@ -928,7 +1233,7 @@ pub async fn fetch_media_metadata(
     // - `--playlist-items 1`: if pure playlist URL, only extract first item instead of crawling all
     // - `--no-check-formats`: skip stream format probing (< 2 sec response)
     // - `--no-warnings` & `--ignore-errors`: suppress non-fatal warnings
-    let args = vec![
+    let mut args = vec![
         "--dump-single-json".to_string(),
         "--skip-download".to_string(),
         "--no-playlist".to_string(),
@@ -937,8 +1242,18 @@ pub async fn fetch_media_metadata(
         "--no-check-formats".to_string(),
         "--no-warnings".to_string(),
         "--ignore-errors".to_string(),
-        trimmed_url.to_string(),
+        "--js-runtimes".to_string(),
+        "node".to_string(),
     ];
+
+    if let Some(browser) = cookies.map(str::trim).filter(|c| !c.is_empty()) {
+        args.push("--cookies-from-browser".to_string());
+        args.push(browser.to_string());
+        args.push("--compat-options".to_string());
+        args.push("no-keep-subs".to_string());
+    }
+
+    args.push(trimmed_url.to_string());
 
     let (mut rx, child) = spawn_ytdlp_process(app, args)?;
 
@@ -1289,6 +1604,353 @@ mod tests {
         assert_eq!(meta.duration, Some(240));
         assert_eq!(meta.uploader.as_deref(), Some("Awesome Creator"));
         assert_eq!(meta.webpage_url, "https://fallback.url");
+    }
+
+    #[test]
+    fn test_sort_and_prioritize_subtitles() {
+        let langs = vec![
+            "es".to_string(),
+            "en".to_string(),
+            "km".to_string(),
+            "de".to_string(),
+            "km-orig".to_string(),
+            "en-US".to_string(),
+            "fr".to_string(),
+            "km".to_string(), // duplicate
+        ];
+
+        let prioritized = sort_and_prioritize_subtitles(langs);
+        assert_eq!(
+            prioritized,
+            vec!["km", "km-orig", "en", "en-US", "de", "es", "fr"]
+        );
+    }
+
+    #[test]
+    fn test_parse_media_metadata_json_with_subtitles() {
+        let sample_json = r#"{
+            "title": "Khmer Voice Dubbing Tutorial",
+            "duration": 600,
+            "webpage_url": "https://www.youtube.com/watch?v=sample",
+            "subtitles": {
+                "en": [{"ext": "vtt"}],
+                "km": [{"ext": "vtt"}]
+            },
+            "automatic_captions": {
+                "km-orig": [{"ext": "srv3"}],
+                "en": [{"ext": "srv3"}],
+                "zh": [{"ext": "srv3"}]
+            }
+        }"#;
+
+        let meta = parse_media_metadata_json(sample_json, "https://sample.url").unwrap();
+        assert_eq!(meta.title, "Khmer Voice Dubbing Tutorial");
+        assert_eq!(meta.available_subtitles, vec!["km", "km-orig", "en", "zh"]);
+    }
+
+    #[test]
+    fn test_build_arguments_with_subtitles_and_thumbnail() {
+        let payload = DownloadPayload {
+            task_id: Some("test_task".into()),
+            url: "https://www.youtube.com/watch?v=subtest".into(),
+            format_type: "video".into(),
+            quality: "1080p".into(),
+            is_playlist: false,
+            use_gpu: false,
+            save_path: Some("C:/Downloads".into()),
+            download_subtitle: true,
+            subtitle_lang: Some("orig".into()),
+            download_thumbnail: true,
+            download_metadata: false,
+            browser_cookies: None,
+        };
+
+        let args = build_arguments_internal(Some("C:/ffmpeg/bin/ffmpeg.exe".into()), &payload);
+
+        assert!(args.contains(&"--write-subs".to_string()));
+        assert!(args.contains(&"--write-auto-subs".to_string()));
+        assert!(args.contains(&"--sub-langs".to_string()));
+
+        let sub_langs_pos = args.iter().position(|a| a == "--sub-langs").unwrap();
+        assert_eq!(args[sub_langs_pos + 1], "orig,.*-orig,default,km.*,en.*");
+
+        let convert_subs_pos = args.iter().position(|a| a == "--convert-subs").unwrap();
+        assert_eq!(args[convert_subs_pos + 1], "srt");
+
+        assert!(args.contains(&"--compat-options".to_string()));
+        let compat_pos = args.iter().position(|a| a == "--compat-options").unwrap();
+        assert_eq!(args[compat_pos + 1], "no-keep-subs");
+
+        assert!(args.contains(&"--write-thumbnail".to_string()));
+        let convert_thumb_pos = args.iter().position(|a| a == "--convert-thumbnails").unwrap();
+        assert_eq!(args[convert_thumb_pos + 1], "jpg");
+
+        assert!(args.contains(&"--sleep-subtitles".to_string()));
+        let sleep_pos = args.iter().position(|a| a == "--sleep-subtitles").unwrap();
+        assert_eq!(args[sleep_pos + 1], "2");
+
+        assert!(args.contains(&"--no-abort-on-error".to_string()));
+        assert!(args.contains(&"--ignore-no-formats-error".to_string()));
+
+        assert!(args.contains(&"--extractor-retries".to_string()));
+        let retries_pos = args.iter().position(|a| a == "--extractor-retries").unwrap();
+        assert_eq!(args[retries_pos + 1], "3");
+
+        assert!(args.contains(&"--retry-sleep".to_string()));
+        let retry_sleep_pos = args.iter().position(|a| a == "--retry-sleep").unwrap();
+        assert_eq!(args[retry_sleep_pos + 1], "extractor:3");
+    }
+
+    #[test]
+    fn test_build_arguments_default_subtitle_lang() {
+        let payload = DownloadPayload {
+            task_id: None,
+            url: "https://www.youtube.com/watch?v=subtest2".into(),
+            format_type: "audio".into(),
+            quality: "best".into(),
+            is_playlist: false,
+            use_gpu: false,
+            save_path: None,
+            download_subtitle: true,
+            subtitle_lang: None,
+            download_thumbnail: false,
+            download_metadata: false,
+            browser_cookies: None,
+        };
+
+        let args = build_arguments_internal(None, &payload);
+
+        assert!(args.contains(&"--write-subs".to_string()));
+        assert!(args.contains(&"--write-auto-subs".to_string()));
+        let sub_langs_pos = args.iter().position(|a| a == "--sub-langs").unwrap();
+        assert_eq!(args[sub_langs_pos + 1], "orig,.*-orig,default,km.*,en.*");
+        let convert_subs_pos = args.iter().position(|a| a == "--convert-subs").unwrap();
+        assert_eq!(args[convert_subs_pos + 1], "srt");
+        assert!(args.contains(&"--compat-options".to_string()));
+        assert!(!args.contains(&"--write-thumbnail".to_string()));
+    }
+
+    #[test]
+    fn test_build_arguments_expanded_video_formats() {
+        for ext in &["mp4", "mkv", "webm", "mov", "avi"] {
+            let payload = DownloadPayload {
+                task_id: None,
+                url: "https://www.youtube.com/watch?v=vidtest".into(),
+                format_type: ext.to_string(),
+                quality: "best".into(),
+                is_playlist: false,
+                use_gpu: false,
+                save_path: None,
+                download_subtitle: false,
+                subtitle_lang: None,
+                download_thumbnail: false,
+                download_metadata: false,
+                browser_cookies: None,
+            };
+
+            let args = build_arguments_internal(None, &payload);
+
+            let f_pos = args.iter().position(|a| a == "-f").unwrap();
+            assert_eq!(args[f_pos + 1], "bestvideo+bestaudio/best");
+
+            match *ext {
+                "mkv" => {
+                    assert!(args.contains(&"--merge-output-format".to_string()));
+                    let merge_pos = args.iter().position(|a| a == "--merge-output-format").unwrap();
+                    assert_eq!(args[merge_pos + 1], "mkv");
+                }
+                "webm" => {
+                    assert!(args.contains(&"--merge-output-format".to_string()));
+                    let merge_pos = args.iter().position(|a| a == "--merge-output-format").unwrap();
+                    assert_eq!(args[merge_pos + 1], "webm");
+                }
+                "mp4" => {
+                    assert!(args.contains(&"--merge-output-format".to_string()));
+                    let merge_pos = args.iter().position(|a| a == "--merge-output-format").unwrap();
+                    assert_eq!(args[merge_pos + 1], "mp4");
+                    assert!(args.contains(&"Merger:-c:a aac -b:a 192k".to_string()));
+                }
+                "mov" | "avi" => {
+                    assert!(args.contains(&"--recode-video".to_string()));
+                    let recode_pos = args.iter().position(|a| a == "--recode-video").unwrap();
+                    assert_eq!(args[recode_pos + 1], *ext);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_arguments_expanded_audio_formats() {
+        for ext in &["mp3", "m4a", "wav", "flac", "aac", "opus"] {
+            let payload = DownloadPayload {
+                task_id: None,
+                url: "https://www.youtube.com/watch?v=audiotest".into(),
+                format_type: ext.to_string(),
+                quality: "best".into(),
+                is_playlist: false,
+                use_gpu: false,
+                save_path: None,
+                download_subtitle: false,
+                subtitle_lang: None,
+                download_thumbnail: false,
+                download_metadata: false,
+                browser_cookies: None,
+            };
+
+            let args = build_arguments_internal(None, &payload);
+            assert!(args.contains(&"-x".to_string()));
+            assert!(args.contains(&"--audio-format".to_string()));
+            let format_pos = args.iter().position(|a| a == "--audio-format").unwrap();
+            assert_eq!(args[format_pos + 1], *ext);
+
+            assert!(args.contains(&"--audio-quality".to_string()));
+            let qual_pos = args.iter().position(|a| a == "--audio-quality").unwrap();
+            assert_eq!(args[qual_pos + 1], "0");
+
+            if *ext == "aac" {
+                assert!(args.contains(&"--postprocessor-args".to_string()));
+                assert!(args.contains(&"ExtractAudio:-c:a aac".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_dynamic_quality_format_selector() {
+        let test_cases = [
+            ("4k", "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"),
+            ("2160p", "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"),
+            ("2160", "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"),
+            ("1080p", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"),
+            ("1080", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"),
+            ("720p", "bestvideo[height<=720]+bestaudio/best[height<=720]/best"),
+            ("720", "bestvideo[height<=720]+bestaudio/best[height<=720]/best"),
+            ("best", "bestvideo+bestaudio/best"),
+            ("unknown", "bestvideo+bestaudio/best"),
+        ];
+
+        for (q, expected_format) in test_cases {
+            let payload = DownloadPayload {
+                task_id: None,
+                url: "https://www.youtube.com/watch?v=qualtest".into(),
+                format_type: "mp4".into(),
+                quality: q.into(),
+                is_playlist: false,
+                use_gpu: false,
+                save_path: None,
+                download_subtitle: false,
+                subtitle_lang: None,
+                download_thumbnail: false,
+                download_metadata: false,
+                browser_cookies: None,
+            };
+
+            let args = build_arguments_internal(None, &payload);
+            let f_pos = args.iter().position(|a| a == "-f").unwrap();
+            assert_eq!(args[f_pos + 1], expected_format, "Failed for quality: {}", q);
+        }
+    }
+
+    #[test]
+    fn test_build_arguments_with_metadata_export() {
+        let payload = DownloadPayload {
+            task_id: None,
+            url: "https://www.youtube.com/watch?v=metatest".into(),
+            format_type: "mp4".into(),
+            quality: "1080p".into(),
+            is_playlist: false,
+            use_gpu: false,
+            save_path: None,
+            download_subtitle: false,
+            subtitle_lang: None,
+            download_thumbnail: false,
+            download_metadata: true,
+            browser_cookies: None,
+        };
+
+        let args = build_arguments_internal(None, &payload);
+        assert!(args.contains(&"--write-info-json".to_string()));
+
+        let mut payload_no_meta = payload.clone();
+        payload_no_meta.download_metadata = false;
+        let args2 = build_arguments_internal(None, &payload_no_meta);
+        assert!(!args2.contains(&"--write-info-json".to_string()));
+    }
+
+    #[test]
+    fn test_build_arguments_with_browser_cookies() {
+        let mut payload = DownloadPayload {
+            task_id: None,
+            url: "https://www.youtube.com/watch?v=cookietest".into(),
+            format_type: "mp4".into(),
+            quality: "1080p".into(),
+            is_playlist: false,
+            use_gpu: false,
+            save_path: None,
+            download_subtitle: false,
+            subtitle_lang: None,
+            download_thumbnail: false,
+            download_metadata: false,
+            browser_cookies: Some("firefox".into()),
+        };
+
+        let args = build_arguments_internal(None, &payload);
+        assert!(args.contains(&"--cookies-from-browser".to_string()));
+        let cookie_pos = args.iter().position(|a| a == "--cookies-from-browser").unwrap();
+        assert_eq!(args[cookie_pos + 1], "firefox");
+        assert!(args.contains(&"--compat-options".to_string()));
+        let compat_pos = args.iter().position(|a| a == "--compat-options").unwrap();
+        assert_eq!(args[compat_pos + 1], "no-keep-subs");
+
+        // When empty or None, cookie flags should NOT be added
+        payload.browser_cookies = Some("   ".into());
+        let args_empty = build_arguments_internal(None, &payload);
+        assert!(!args_empty.contains(&"--cookies-from-browser".to_string()));
+
+        payload.browser_cookies = None;
+        let args_none = build_arguments_internal(None, &payload);
+        assert!(!args_none.contains(&"--cookies-from-browser".to_string()));
+    }
+
+    #[test]
+    fn test_export_metadata_txt_creation_and_cleanup() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "meta_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let json_path = temp_dir.join("test_video.info.json");
+        let txt_path = temp_dir.join("test_video.txt");
+
+        let sample_json = r#"{
+            "title": "Awesome Tauri v2 Tutorial",
+            "description": "Learn Rust and React for desktop development.\nSecond line of description.",
+            "tags": ["tauri", "rust", "react", "desktop"]
+        }"#;
+
+        std::fs::write(&json_path, sample_json.as_bytes()).unwrap();
+        assert!(json_path.exists());
+
+        let result = export_metadata_txt(&json_path, &txt_path);
+        assert!(result.is_ok());
+
+        // Output .txt file must exist
+        assert!(txt_path.exists());
+        let txt_content = std::fs::read_to_string(&txt_path).unwrap();
+
+        assert!(txt_content.contains("TITLE\n==================================================\nAwesome Tauri v2 Tutorial"));
+        assert!(txt_content.contains("KEYWORDS / TAGS\n==================================================\ntauri, rust, react, desktop"));
+        assert!(txt_content.contains("DESCRIPTION\n==================================================\nLearn Rust and React for desktop development."));
+
+        // Intermediate .info.json must be deleted
+        assert!(!json_path.exists());
+
+        // Cleanup temp dir
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 

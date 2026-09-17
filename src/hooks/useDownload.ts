@@ -123,6 +123,12 @@ export function useDownload() {
           is_playlist: options.isPlaylist,
           use_gpu: options.useGpu,
           save_path: options.savePath.trim() || null,
+          download_subtitle: options.downloadSubtitle ?? false,
+          subtitle_lang: options.subtitleLang || null,
+          download_thumbnail: options.downloadThumbnail ?? false,
+          download_metadata: options.downloadMetadata ?? false,
+          browser_cookies: options.browserCookies || null,
+          browserCookies: options.browserCookies || undefined,
         },
       });
 

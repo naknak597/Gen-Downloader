@@ -4,10 +4,12 @@ pub mod models;
 pub mod state;
 
 pub use commands::{
-    cancel_download, get_media_info, get_playlist_items, open_media_file, show_in_folder,
-    start_download,
+    cancel_download, get_core_versions, get_media_info, get_playlist_items, open_media_file,
+    show_in_folder, start_download, update_ytdlp_binary,
 };
-pub use models::{DownloadPayload, DownloadRequest, MediaMetadata, PlaylistItem, ProgressPayload};
+pub use models::{
+    CoreVersions, DownloadPayload, DownloadRequest, MediaMetadata, PlaylistItem, ProgressPayload,
+};
 pub use state::DownloadManager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -25,7 +27,9 @@ pub fn run() {
             commands::open_media_file,
             commands::show_in_folder,
             commands::get_playlist_items,
-            commands::get_media_info
+            commands::get_media_info,
+            commands::update_ytdlp_binary,
+            commands::get_core_versions
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

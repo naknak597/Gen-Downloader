@@ -7,10 +7,10 @@ use std::os::windows::process::CommandExt;
 
 use crate::engine::{
     build_arguments, clean_filename, clean_filepath, extract_destination_filename,
-    extract_destination_filepath, parse_playlist_progress, resolve_safe_save_path,
-    scan_playlist_directory, spawn_ytdlp_process,
+    extract_destination_filepath, find_ytdlp_executable, parse_playlist_progress,
+    resolve_ffmpeg_path, resolve_safe_save_path, scan_playlist_directory, spawn_ytdlp_process,
 };
-use crate::models::{DownloadPayload, MediaMetadata, PlaylistItem, ProgressPayload};
+use crate::models::{CoreVersions, DownloadPayload, MediaMetadata, PlaylistItem, ProgressPayload};
 use crate::state::DownloadManager;
 
 #[tauri::command]
@@ -52,6 +52,7 @@ pub async fn start_download(
     let current_task_id = task_id.clone();
     let download_manager = state.inner().clone();
     let is_playlist_download = payload.is_playlist;
+    let download_metadata = payload.download_metadata;
 
     // Spawn background task to process stdout/stderr streams concurrently without pipe deadlock
     tauri::async_runtime::spawn(async move {
@@ -337,6 +338,11 @@ pub async fn start_download(
                 current_task_id, final_display_name, final_file_path
             );
 
+            // Cleanly export metadata to .txt alongside media if requested
+            if download_metadata {
+                crate::engine::process_downloaded_metadata(&target_dir, final_file_path.as_deref());
+            }
+
             let progress = ProgressPayload {
                 task_id: current_task_id.clone(),
                 status: "Completed".into(),
@@ -557,7 +563,250 @@ pub async fn get_playlist_items(dir_path: String) -> Result<Vec<PlaylistItem>, S
 
 /// Fetches media metadata (title, thumbnail, duration, uploader) for video preview
 #[tauri::command]
-pub async fn get_media_info(app: tauri::AppHandle, url: String) -> Result<MediaMetadata, String> {
-    crate::engine::fetch_media_metadata(&app, &url).await
+pub async fn get_media_info(
+    app: tauri::AppHandle,
+    url: String,
+    cookies: Option<String>,
+) -> Result<MediaMetadata, String> {
+    crate::engine::fetch_media_metadata(&app, &url, cookies.as_deref()).await
 }
+
+/// Updates the bundled yt-dlp binary to its latest release via `yt-dlp -U`
+#[tauri::command]
+pub async fn update_ytdlp_binary(app: AppHandle) -> Result<String, String> {
+    println!("[updater] Initiating in-app core update for yt-dlp (-U)...");
+
+    // 1. Ensure Windows executable write permissions are respected
+    if let Some(exe_path) = find_ytdlp_executable(Some(&app)) {
+        if let Ok(metadata) = std::fs::metadata(&exe_path) {
+            let mut perms = metadata.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                if let Err(e) = std::fs::set_permissions(&exe_path, perms) {
+                    eprintln!(
+                        "[updater] Warning: could not clear read-only flag on {}: {e}",
+                        exe_path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    // 2. Spawn yt-dlp sidecar with "-U"
+    let (mut rx, _child) = spawn_ytdlp_process(&app, vec!["-U".to_string()])?;
+
+    // 3. Collect stdout & stderr with timeout protection
+    let timeout_duration = std::time::Duration::from_secs(60);
+    let mut stdout_lines = Vec::new();
+    let mut stderr_lines = Vec::new();
+    let mut exit_code: Option<i32> = None;
+
+    let read_result = tokio::time::timeout(timeout_duration, async {
+        while let Some(event) = rx.recv().await {
+            match event {
+                CommandEvent::Stdout(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    for line in text.lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            println!("[updater:stdout] {}", trimmed);
+                            stdout_lines.push(trimmed.to_string());
+                        }
+                    }
+                }
+                CommandEvent::Stderr(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    for line in text.lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            println!("[updater:stderr] {}", trimmed);
+                            stderr_lines.push(trimmed.to_string());
+                        }
+                    }
+                }
+                CommandEvent::Error(err) => {
+                    return Err(format!("yt-dlp execution error: {err}"));
+                }
+                CommandEvent::Terminated(payload) => {
+                    exit_code = payload.code;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    if read_result.is_err() {
+        return Err(
+            "yt-dlp update timed out after 60 seconds. Please check your network connection."
+                .to_string(),
+        );
+    }
+    if let Ok(Err(err)) = read_result {
+        return Err(err);
+    }
+
+    // 4. Evaluate termination status & output errors
+    let is_failure = exit_code.map(|c| c != 0).unwrap_or(false);
+    let combined_stderr = stderr_lines.join("\n");
+    let combined_stdout = stdout_lines.join("\n");
+    let combined_all = format!("{}\n{}", combined_stderr, combined_stdout).to_lowercase();
+
+    if combined_all.contains("permission denied")
+        || combined_all.contains("access is denied")
+        || combined_all.contains("winerror 5")
+        || combined_all.contains("errno 13")
+        || combined_all.contains("can't modify")
+    {
+        return Err(
+            "Permission denied: Unable to modify yt-dlp binary. Please run Gen Downloader as administrator or check folder permissions.".to_string(),
+        );
+    }
+
+    if is_failure {
+        let err_msg = if !stderr_lines.is_empty() {
+            stderr_lines.join("; ")
+        } else if !stdout_lines.is_empty() {
+            stdout_lines.join("; ")
+        } else {
+            format!("Update process exited with code {:?}", exit_code)
+        };
+        return Err(format!("Update failed: {err_msg}"));
+    }
+
+    // 5. Parse formatted status string
+    Ok(parse_ytdlp_update_status(&stdout_lines))
+}
+
+/// Helper to parse yt-dlp -U stdout lines into user-friendly status message
+pub fn parse_ytdlp_update_status(stdout_lines: &[String]) -> String {
+    let ver_regex = regex::Regex::new(r"\d{4}\.\d{2}\.\d{2}").ok();
+
+    for line in stdout_lines.iter().rev() {
+        if line.contains("is up to date") {
+            if let Some(ref re) = ver_regex {
+                if let Some(mat) = re.find(line) {
+                    return format!("yt-dlp is up to date ({})", mat.as_str());
+                }
+            }
+            return line.clone();
+        }
+        if line.contains("Updated yt-dlp to version") || line.contains("Updating to version") {
+            if let Some(ref re) = ver_regex {
+                if let Some(mat) = re.find(line) {
+                    return format!("Updated yt-dlp to version {}", mat.as_str());
+                }
+            }
+            return line.clone();
+        }
+    }
+
+    if let Some(last_line) = stdout_lines.last() {
+        return last_line.clone();
+    }
+
+    "yt-dlp is up to date.".to_string()
+}
+
+/// Helper to extract clean FFmpeg version from stdout first line
+pub fn parse_ffmpeg_version_line(first_line: &str) -> String {
+    let trimmed = first_line.trim();
+    if let Some(ver) = trimmed.strip_prefix("ffmpeg version ") {
+        ver.split_whitespace().next().unwrap_or(ver).to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Returns the current versions of the core binaries (yt-dlp and ffmpeg)
+#[tauri::command]
+pub async fn get_core_versions(app: AppHandle) -> Result<CoreVersions, String> {
+    // 1. Query yt-dlp version using spawn_ytdlp_process with --version
+    let mut ytdlp_version = "Unknown".to_string();
+    if let Ok((mut rx, _child)) = spawn_ytdlp_process(&app, vec!["--version".to_string()]) {
+        let timeout_duration = std::time::Duration::from_secs(6);
+        let _ = tokio::time::timeout(timeout_duration, async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    CommandEvent::Stdout(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        if let Some(line) = text.lines().next() {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                ytdlp_version = trimmed.to_string();
+                                break;
+                            }
+                        }
+                    }
+                    CommandEvent::Terminated(_) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await;
+    }
+
+    // 2. Query FFmpeg version using resolve_ffmpeg_path
+    let mut ffmpeg_version = "Not Found".to_string();
+    if let Some(ffmpeg_path) = resolve_ffmpeg_path(Some(&app)) {
+        let mut cmd = std::process::Command::new(&ffmpeg_path);
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        cmd.arg("-version");
+        if let Ok(output) = cmd.output() {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            if let Some(first_line) = out_str.lines().next() {
+                ffmpeg_version = parse_ffmpeg_version_line(first_line);
+            }
+        }
+    }
+
+    Ok(CoreVersions {
+        ytdlp_version,
+        ffmpeg_version,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_ytdlp_update_status_up_to_date() {
+        let stdout = vec![
+            "Latest version: stable@2026.08.19 from yt-dlp/yt-dlp".to_string(),
+            "yt-dlp is up to date (stable@2026.08.19 from yt-dlp/yt-dlp)".to_string(),
+        ];
+        let status = parse_ytdlp_update_status(&stdout);
+        assert_eq!(status, "yt-dlp is up to date (2026.08.19)");
+    }
+
+    #[test]
+    fn test_parse_ytdlp_update_status_updated() {
+        let stdout = vec![
+            "Updating to version 2026.09.15 ...".to_string(),
+            "Updated yt-dlp to version 2026.09.15".to_string(),
+        ];
+        let status = parse_ytdlp_update_status(&stdout);
+        assert_eq!(status, "Updated yt-dlp to version 2026.09.15");
+    }
+
+    #[test]
+    fn test_parse_ffmpeg_version_line() {
+        let line = "ffmpeg version 2026-09-10-git-fd7c73d01e-essentials_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers";
+        assert_eq!(
+            parse_ffmpeg_version_line(line),
+            "2026-09-10-git-fd7c73d01e-essentials_build-www.gyan.dev"
+        );
+
+        let line_clean = "ffmpeg version 7.1 Copyright (c)";
+        assert_eq!(parse_ffmpeg_version_line(line_clean), "7.1");
+    }
+}
+
+
 
