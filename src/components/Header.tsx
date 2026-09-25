@@ -78,7 +78,7 @@ export const Header: React.FC = () => {
               Gen Downloader
             </h1>
             <span className="text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700/60">
-              v2.0
+              v1.0
             </span>
           </div>
           <p className="text-xs text-neutral-400">High-Performance Media Engine</p>
