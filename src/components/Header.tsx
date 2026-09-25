@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { Zap, Cpu, RefreshCw, CheckCircle2, AlertCircle, X } from "lucide-react";
+import { Cpu, RefreshCw, CheckCircle2, AlertCircle, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { CoreVersions } from "../types/download";
 
@@ -66,9 +66,12 @@ export const Header: React.FC = () => {
   return (
     <header className="flex items-center justify-between px-6 py-3.5 bg-neutral-900/70 border-b border-neutral-800/80 backdrop-blur-md shrink-0">
       <div className="flex items-center gap-3">
-        <div className="flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-tr from-cyan-500 via-indigo-600 to-purple-600 shadow-lg shadow-indigo-500/20">
-          <Zap className="w-5 h-5 text-white fill-white/20" />
-        </div>
+        {/* New App Logo */}
+        <img
+          src="/logo.png"
+          alt="Gen Downloader Logo"
+          className="w-9 h-9 rounded-xl object-cover shadow-lg shadow-purple-500/20 border border-neutral-700/60"
+        />
         <div>
           <div className="flex items-center gap-2">
             <h1 className="text-base font-bold tracking-tight bg-gradient-to-r from-neutral-100 via-neutral-200 to-neutral-400 bg-clip-text text-transparent">
